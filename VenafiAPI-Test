@@ -1,0 +1,176 @@
+<# 
+.SYNOPSIS
+  Verifies API access to a Venafi TPP (WebSDK) server by performing OAuth and a simple authenticated call.
+
+.DESCRIPTION
+  - Authenticates to https://<tpp>/vedsdk via OAuth (password grant).
+  - Optionally skips TLS verification (for lab/testing).
+  - Performs a lightweight POST to Config/Read for \VED to confirm token works.
+  - Prints clear PASS/FAIL results and returns non-zero exit code on failure.
+
+.PARAMETER BaseUrl
+  Base URL to the TPP WebSDK (e.g. https://tpp.example.com/vedsdk).
+
+.PARAMETER Username
+  TPP username (typically a service account).
+
+.PARAMETER Password
+  TPP password (plain text). You can also pass -SecurePassword instead.
+
+.PARAMETER SecurePassword
+  TPP password as a SecureString (preferred).
+
+.PARAMETER Scope
+  OAuth scope to request (default: certificate:manage).
+
+.PARAMETER SkipTlsVerify
+  Skip TLS certificate validation (NOT recommended for production).
+
+.PARAMETER TimeoutSec
+  HTTP timeout in seconds (default: 30).
+
+.EXAMPLE
+  .\verify_tpp_api.ps1 -BaseUrl "https://tpp.example.com/vedsdk" -Username "svc_user" -Password "Secret123!"
+
+.EXAMPLE
+  $sec = Read-Host "Password" -AsSecureString
+  .\verify_tpp_api.ps1 -BaseUrl "https://tpp.example.com/vedsdk" -Username "svc_user" -SecurePassword $sec -SkipTlsVerify
+
+#>
+
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)]
+  [string]$BaseUrl,
+
+  [Parameter(Mandatory=$true)]
+  [string]$Username,
+
+  [Parameter(Mandatory=$false)]
+  [string]$Password,
+
+  [Parameter(Mandatory=$false)]
+  [SecureString]$SecurePassword,
+
+  [Parameter(Mandatory=$false)]
+  [string]$Scope = "certificate:manage",
+
+  [switch]$SkipTlsVerify,
+
+  [int]$TimeoutSec = 30
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Set-TrustAllCerts {
+  param([switch]$Enable)
+  if ($Enable) {
+    add-type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+  public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate, WebRequest request, int certificateProblem) { return true; }
+}
+"@ -ErrorAction SilentlyContinue
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+  }
+}
+
+function Invoke-TppRest {
+  param(
+    [Parameter(Mandatory)][string]$Url,
+    [Parameter()][hashtable]$Headers,
+    [Parameter()][hashtable]$Body
+  )
+  $json = if ($Body) { $Body | ConvertTo-Json -Depth 8 -Compress } else { "{}" }
+  Invoke-RestMethod -Uri $Url -Method POST -Headers $Headers -Body $json -ContentType "application/json" -TimeoutSec $TimeoutSec
+}
+
+# --- Prep ---
+$base = $BaseUrl.TrimEnd('/')
+
+# Convert secure password if provided
+if (-not $Password -and $SecurePassword) {
+  $Password = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
+  )
+}
+
+if (-not $Password) {
+  Write-Error "No password provided. Use -Password or -SecurePassword."
+  exit 2
+}
+
+# Optional TLS skip (for labs)
+if ($SkipTlsVerify) { Set-TrustAllCerts -Enable }
+
+# --- 1) OAuth Login ---
+try {
+  $oauthUrl = "$base/Authorize/OAuth"
+  $oauthBody = @{
+    client_id  = "tpp"
+    username   = $Username
+    password   = $Password
+    scope      = $Scope
+    grant_type = "password"
+  }
+
+  Write-Host "Authenticating to $base ..." -ForegroundColor Cyan
+  $oauthResp = Invoke-TppRest -Url $oauthUrl -Body $oauthBody
+  $accessToken  = $oauthResp.access_token
+  $refreshToken = $oauthResp.refresh_token
+
+  if (-not $accessToken) {
+    Write-Error "Authentication failed: no access_token returned."
+    exit 3
+  }
+
+  Write-Host "PASS: OAuth succeeded. Access token acquired." -ForegroundColor Green
+}
+catch {
+  Write-Host "FAIL: OAuth failed. $_" -ForegroundColor Red
+  exit 3
+}
+
+# --- 2) Simple Authenticated Call (sanity check) ---
+# We call Config/Read against \VED (root). This verifies token usage and basic permissions.
+try {
+  $headers = @{ Authorization = "Bearer $accessToken" }
+  $cfgUrl  = "$base/Config/Read"
+  $cfgBody = @{ ObjectDN = "\VED" }
+
+  Write-Host "Verifying authenticated access with Config/Read (\VED) ..." -ForegroundColor Cyan
+  $cfgResp = Invoke-TppRest -Url $cfgUrl -Headers $headers -Body $cfgBody
+
+  # Print a concise summary
+  $className = $cfgResp.ClassName
+  $objDn     = $cfgResp.Object.DN
+  if ($className -or $objDn) {
+    Write-Host "PASS: API call succeeded. Object: $objDn  Class: $className" -ForegroundColor Green
+  } else {
+    Write-Host "PASS: API call succeeded." -ForegroundColor Green
+  }
+
+  # Optional: show token snippet (obfuscated)
+  $tokenPreview = if ($accessToken.Length -ge 12) { $accessToken.Substring(0,6) + "..." + $accessToken.Substring($accessToken.Length-6) } else { "[short token]" }
+  Write-Host "Token: $tokenPreview"
+  exit 0
+}
+catch {
+  # If permissions are insufficient, we still verified auth but failed on the resource.
+  # Differentiate 401/403 vs other errors if possible.
+  $msg = $_.Exception.Message
+  if ($msg -match "401" -or $msg -match "Unauthorized") {
+    Write-Host "FAIL: Auth token rejected on API call (401). Check scopes/permissions." -ForegroundColor Red
+    exit 4
+  }
+  elseif ($msg -match "403" -or $msg -match "Forbidden") {
+    Write-Host "WARN: Auth OK, but access to \VED is forbidden (403). Your account may lack Config/Read rights. The server is reachable and the token is valid." -ForegroundColor Yellow
+    exit 0
+  }
+  else {
+    Write-Host "FAIL: API call failed. $msg" -ForegroundColor Red
+    exit 5
+  }
+}
