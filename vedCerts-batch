@@ -1,0 +1,59 @@
+param(
+    [string]$BaseUrl = "https://tpp.example.com/vedsdk",
+    [string]$Username = "svc_tpp_api",
+    [string]$Password = "SuperSecret123!",
+    [string]$CsvPath  = ".\cert_requests.csv",
+    [switch]$SkipTlsVerify
+)
+
+if ($SkipTlsVerify) {
+    add-type @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(
+        ServicePoint srvPoint, X509Certificate certificate,
+        WebRequest request, int certificateProblem) { return true; }
+}
+"@
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+}
+
+# Authenticate once
+Write-Host "Authenticating to $BaseUrl ..."
+$authBody = @{
+    Username = $Username
+    Password = $Password
+}
+$tokenResp = Invoke-RestMethod -Method POST -Uri "$BaseUrl/authorize/oauth" -Body $authBody -ContentType "application/json"
+if (-not $tokenResp.access_token) {
+    Write-Error "Authentication failed."
+    exit 1
+}
+$headers = @{ Authorization = "Bearer $($tokenResp.access_token)" }
+
+# Read requests
+$requests = Import-Csv -Path $CsvPath
+foreach ($req in $requests) {
+    Write-Host "Requesting cert for $($req.CN) ..."
+    $body = @{
+        PolicyDN        = $req.PolicyDN
+        ObjectName      = $req.CN
+        Subject         = "CN=$($req.CN),OU=$($req.OU),O=$($req.O),L=$($req.L),ST=$($req.ST),C=$($req.C)"
+        KeyAlgorithm    = "RSA"
+        KeyBitStrength  = [int]$req.KeySize
+        SubjectAltNames = ($req.SubjectAltNames -split ";") | ForEach-Object { @{ Type = "DNS" ; Value = $_ } }
+    } | ConvertTo-Json -Depth 5
+
+    try {
+        $resp = Invoke-RestMethod -Method POST -Uri "$BaseUrl/Certificates/Request" -Headers $headers -Body $body -ContentType "application/json"
+        if ($resp.CertificateDN) {
+            Write-Host "✅ Created: $($resp.CertificateDN)"
+        } else {
+            Write-Warning "No CertificateDN returned for $($req.CN)"
+        }
+    }
+    catch {
+        Write-Warning "❌ Failed for $($req.CN): $($_.Exception.Message)"
+    }
+}
